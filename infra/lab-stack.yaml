@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: UCAB Lab 4 - comparacion experimental entre IaaS y FaaS
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+  IaasArtifactKey:
+    Type: String
+  FaaSArtifactKey:
+    Type: String
+  ApiArtifactKey:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+  LatestAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Rules:
+  OhioOnly:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-east-2]
+        AssertDescription: El laboratorio solo puede desplegarse en us-east-2.
+
+Resources:
+  LabVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+        - Key: Course
+          Value: INFO-02028
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVpc
+      CidrBlock: 10.42.0.0/27
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  IaasSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sin trafico entrante; administracion exclusiva mediante SSM
+      VpcId: !Ref LabVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: JobId
+          AttributeType: S
+        - AttributeName: Model
+          AttributeType: S
+      KeySchema:
+        - AttributeName: JobId
+          KeyType: HASH
+        - AttributeName: Model
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Course
+          Value: INFO-02028
+        - Key: LabId
+          Value: !Ref "AWS::StackName"
+
+  IaasDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 3600
+      SqsManagedSseEnabled: true
+
+  FaaSDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 3600
+      SqsManagedSseEnabled: true
+
+  IaasQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      ReceiveMessageWaitTimeSeconds: 10
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 3600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IaasDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Model
+          Value: IaaS
+        - Key: LabId
+          Value: !Ref "AWS::StackName"
+
+  FaaSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      ReceiveMessageWaitTimeSeconds: 10
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 3600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FaaSDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Model
+          Value: FaaS
+        - Key: LabId
+          Value: !Ref "AWS::StackName"
+
+  IaasRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: LabWorkerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IaasQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${IaasArtifactKey}"
+
+  IaasInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref IaasRole
+
+  BootstrapWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  IaasInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DefaultRoute
+      - PublicRouteAssociation
+    Properties:
+      ImageId: !Ref LatestAmi
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref IaasInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref IaasSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-iaas-worker"
+        - Key: Course
+          Value: INFO-02028
+        - Key: Model
+          Value: IaaS
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec > >(tee -a /var/log/ucab-lab-4-bootstrap.log) 2>&1
+          SIGNAL_URL='${BootstrapWaitHandle}'
+          signal_stack() {
+            trap - ERR
+            curl --fail --silent --show-error --request PUT --header 'Content-Type:' \
+              --data-binary "{\"Status\":\"$1\",\"Reason\":\"Consulte /var/log/ucab-lab-4-bootstrap.log\",\"UniqueId\":\"$(hostname)\",\"Data\":\"bootstrap\"}" \
+              "$SIGNAL_URL"
+          }
+          trap 'signal_stack FAILURE' ERR
+          dnf install -y python3.12 python3.12-pip
+          mkdir -p /opt/ucab-lab-4
+          aws s3 cp 's3://${ArtifactBucket}/${IaasArtifactKey}' /tmp/iaas-worker.tar.gz
+          tar -xzf /tmp/iaas-worker.tar.gz -C /opt/ucab-lab-4
+          python3.12 -m venv /opt/ucab-lab-4/venv
+          /opt/ucab-lab-4/venv/bin/pip install --no-cache-dir 'boto3>=1.34,<2'
+          cat >/etc/systemd/system/ucab-iaas-worker.service <<'UNIT'
+          [Unit]
+          Description=UCAB Lab 4 IaaS queue worker
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/opt/ucab-lab-4
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=QUEUE_URL=${IaasQueue}
+          Environment=TABLE_NAME=${ResultsTable}
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=/opt/ucab-lab-4/venv/bin/python3.12 /opt/ucab-lab-4/worker.py
+          Restart=on-failure
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          chown -R ec2-user:ec2-user /opt/ucab-lab-4
+          systemctl daemon-reload
+          systemctl enable --now ucab-iaas-worker.service
+          systemctl is-active --quiet amazon-ssm-agent
+          systemctl is-active --quiet ucab-iaas-worker.service
+          signal_stack SUCCESS
+          trap - ERR
+
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: IaasInstance
+    Properties:
+      Handle: !Ref BootstrapWaitHandle
+      Timeout: "600"
+      Count: 1
+
+  FaaSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerAndLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt FaaSQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${FaaSLogGroup.Arn}:*"
+
+  FaaSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-faas-worker"
+      RetentionInDays: 1
+
+  FaaSFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FaaSLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-faas-worker"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt FaaSRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ResultsTable
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref FaaSArtifactKey
+      Tags:
+        - Key: Course
+          Value: INFO-02028
+        - Key: Model
+          Value: FaaS
+
+  QueueEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FaaSQueue.Arn
+      FunctionName: !Ref FaaSFunction
+      BatchSize: 5
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadResultsAndLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt ResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ApiLogGroup.Arn}:*"
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-data-api"
+      RetentionInDays: 1
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-data-api"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ResultsTable
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ApiArtifactKey
+      Tags:
+        - Key: Course
+          Value: INFO-02028
+        - Key: Product
+          Value: DataAsAService
+
+  DataApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-data-product"
+      ProtocolType: HTTP
+      Description: Producto de datos del laboratorio; requiere firma AWS SigV4
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DataApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 15000
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DataApi
+      RouteKey: GET /jobs/{job_id}
+      AuthorizationType: AWS_IAM
+      Target: !Join ["/", [integrations, !Ref ApiIntegration]]
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref DataApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DataApi}/*/GET/jobs/*"
+
+Outputs:
+  LabId:
+    Value: !Ref "AWS::StackName"
+  Region:
+    Value: !Ref "AWS::Region"
+  InstanceId:
+    Value: !Ref IaasInstance
+  IaasQueueUrl:
+    Value: !Ref IaasQueue
+  FaaSQueueUrl:
+    Value: !Ref FaaSQueue
+  IaasDeadLetterQueueUrl:
+    Value: !Ref IaasDeadLetterQueue
+  FaaSDeadLetterQueueUrl:
+    Value: !Ref FaaSDeadLetterQueue
+  ResultsTableName:
+    Value: !Ref ResultsTable
+  DataApiEndpoint:
+    Value: !GetAtt DataApi.ApiEndpoint
+  FaaSFunctionName:
+    Value: !Ref FaaSFunction
+  IaasLogCommand:
+    Value: journalctl -u ucab-iaas-worker.service --no-pager -n 30

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+build/
+.ucab-lab-4-stack
+.ucab-lab-4-last-jobs
+.coverage
+.pytest_cache/
+.ruff_cache/
